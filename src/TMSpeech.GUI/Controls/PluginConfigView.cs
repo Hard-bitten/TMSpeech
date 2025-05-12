@@ -9,6 +9,7 @@ using Avalonia.Markup.Xaml.Templates;
 using Avalonia.Media;
 using Avalonia.Threading;
 using TMSpeech.Core.Plugins;
+using Avalonia.Controls.Primitives;
 
 namespace TMSpeech.GUI.Controls;
 
@@ -78,6 +79,18 @@ public class PluginConfigView : UserControl
                         break;
                     case ComboBox cb:
                         cb.SelectedValue = value;
+                        break;
+                    case NumericUpDown nud:
+                        if (value != null && double.TryParse(value.ToString(), out var numValue))
+                        {
+                            nud.Value = (decimal)numValue;
+                        }
+                        break;
+                    case CheckBox chk:
+                        if (value != null && bool.TryParse(value.ToString(), out var boolValue))
+                        {
+                            chk.IsChecked = boolValue;
+                        }
                         break;
                 }
             }
@@ -152,6 +165,55 @@ public class PluginConfigView : UserControl
                     UpdateValueAndNotify();
                 };
                 control = cb;
+            }
+            else if (formItem is PluginConfigFormItemNumber numberFormItem)
+            {
+                var nud = new NumericUpDown()
+                {
+                    Tag = numberFormItem.Key,
+                    ShowButtonSpinner = true,
+                    AllowSpin = true,
+                    FormatString = numberFormItem.IsInteger ? "F0" : "F2"
+                };
+                
+                if (numberFormItem.Min.HasValue)
+                {
+                    nud.Minimum = numberFormItem.Min.Value;
+                }
+                
+                if (numberFormItem.Max.HasValue)
+                {
+                    nud.Maximum = numberFormItem.Max.Value;
+                }
+                
+                nud.ValueChanged += (_, _) =>
+                {
+                    if (_updateMode != UpdateMode.ViewToBoth) return;
+                    
+                    if (nud.Value.HasValue)
+                    {
+                        ConfigEditor.SetValue(formItem.Key, nud.Value.Value);
+                        UpdateValueAndNotify();
+                    }
+                };
+                control = nud;
+            }
+            else if (formItem is PluginConfigFormCheckBox checkBoxFormItem)
+            {
+                var chk = new CheckBox()
+                {
+                    Tag = checkBoxFormItem.Key,
+                    Content = checkBoxFormItem.Description
+                };
+                
+                chk.IsCheckedChanged += (_, _) =>
+                {
+                    if (_updateMode != UpdateMode.ViewToBoth) return;
+                    
+                    ConfigEditor.SetValue(formItem.Key, chk.IsChecked);
+                    UpdateValueAndNotify();
+                };
+                control = chk;
             }
             else
             {

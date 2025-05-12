@@ -1,4 +1,4 @@
-﻿using SherpaOnnx;
+﻿﻿using SherpaOnnx;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -48,10 +48,33 @@ namespace TMSpeech.Recognizer.SherpaOnnx
         public event EventHandler<SpeechEventArgs> TextChanged;
         public event EventHandler<SpeechEventArgs> SentenceDone;
 
+        // 用于存储说话者识别结果
+        private class SpeakerSegment
+        {
+            public float Start { get; set; }
+            public float End { get; set; }
+            public int Speaker { get; set; }
+            public string Text { get; set; }
+        }
+
+        private List<SpeakerSegment> _speakerSegments = new List<SpeakerSegment>();
+        private OfflineSpeakerDiarization _speakerDiarization;
+        private bool _meetingModeEnabled = false;
+
         public void Feed(byte[] data)
         {
             var buffer = MemoryMarshal.Cast<byte, float>(data);
-            stream?.AcceptWaveform(config.FeatConfig.SampleRate, buffer.ToArray());
+            var floatArray = buffer.ToArray();
+            
+            // 如果启用了会议模式，需要保存音频数据用于后续的说话者识别
+            if (_meetingModeEnabled && _userConfig.EnableMeetingMode)
+            {
+                lock (_bufferLock)
+                {
+                    _writeBuffer.AddRange(floatArray.Select(f => f));
+                }
+            }
+            stream?.AcceptWaveform(config.FeatConfig.SampleRate, floatArray);
         }
 
         private OnlineRecognizer recognizer;
@@ -64,6 +87,12 @@ namespace TMSpeech.Recognizer.SherpaOnnx
 
         private OnlineRecognizerConfig config;
 
+        private OfflinePunctuation punctuation;
+        
+        // 单缓冲区实现，但使用副本进行处理
+        private readonly object _bufferLock = new object();
+        private List<float> _writeBuffer = new List<float>();
+
         private void Run()
         {
             config = new OnlineRecognizerConfig();
@@ -71,6 +100,61 @@ namespace TMSpeech.Recognizer.SherpaOnnx
             config.FeatConfig.FeatureDim = 80;
 
             string encoder, decoder, joiner, tokens;
+            
+            // 初始化会议模式（说话者识别）
+            if (_userConfig.EnableMeetingMode)
+            {
+                try
+                {
+                    _meetingModeEnabled = true;
+                    var sdConfig = new OfflineSpeakerDiarizationConfig();
+                    
+                    // 设置说话者分割模型
+                    sdConfig.Segmentation.Pyannote.Model = _userConfig.SegmentationModel;
+                    
+                    // 设置说话者嵌入模型
+                    sdConfig.Embedding.Model = _userConfig.EmbeddingModel;
+                    
+                    // 设置聚类参数
+                    if (_userConfig.UseClusteringThreshold)
+                    {
+                        sdConfig.Clustering.Threshold = (float)_userConfig.ClusteringThreshold;
+                    }
+                    else
+                    {
+                        sdConfig.Clustering.NumClusters = _userConfig.NumClusters;
+                    }
+                    
+                    _speakerDiarization = new OfflineSpeakerDiarization(sdConfig);
+                    lock (_bufferLock)
+                    {
+                        _writeBuffer = new List<float>();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Trace.TraceError("{0:HH:mm:ss.fff} Failed to initialize speaker diarization: {1}", DateTime.Now, ex);
+                    _meetingModeEnabled = false;
+                }
+            }
+            
+            // 初始化标点符号功能
+            if (_userConfig.EnablePunctuation && !string.IsNullOrEmpty(_userConfig.PunctuationModel))
+            {
+                try
+                {
+                    var punctConfig = new OfflinePunctuationConfig();
+                    punctConfig.Model.CtTransformer = _userConfig.PunctuationModel;
+                    punctConfig.Model.Debug = 1;
+                    punctConfig.Model.NumThreads = 1;
+                    punctuation = new OfflinePunctuation(punctConfig);
+                }
+                catch (Exception ex)
+                {
+                    Trace.TraceError("{0:HH:mm:ss.fff} Failed to initialize punctuation: {1}", DateTime.Now, ex);
+                    punctuation = null;
+                }
+            }
 
             if (!string.IsNullOrEmpty(_userConfig.Model))
             {
@@ -126,6 +210,12 @@ namespace TMSpeech.Recognizer.SherpaOnnx
 
                 if (!string.IsNullOrEmpty(text))
                 {
+                    // 添加标点符号
+                    if (_userConfig.EnablePunctuation && punctuation != null)
+                    {
+                        text = punctuation.AddPunct(text);
+                    }
+
                     var item = new TextInfo(text);
                     // Console.WriteLine($"{is_endpoint}: {text}");
                     TextChanged?.Invoke(this, new SpeechEventArgs()
@@ -133,8 +223,108 @@ namespace TMSpeech.Recognizer.SherpaOnnx
                         Text = item,
                     });
 
-                    if (is_endpoint || text.Length >= 80)
+                    if (is_endpoint || text.Length > 80)
                     {
+                        // 如果启用了会议模式，处理说话者识别
+                        if (_meetingModeEnabled && _userConfig.EnableMeetingMode)
+                        {
+                            try
+                            {
+                                // 安全地获取音频数据副本
+                                List<float> audioDataCopy = null;
+                                lock (_bufferLock)
+                                {
+                                    // 如果写入缓冲区为空，则不需要处理
+                                    if (_writeBuffer.Count == 0)
+                                    {
+                                        continue;
+                                    }
+                                    
+                                    // 创建写入缓冲区的完整副本，而不是交换缓冲区
+                                    audioDataCopy = new List<float>(_writeBuffer);
+                                    
+                                    // 清空写入缓冲区，为新数据做准备
+                                    _writeBuffer.Clear();
+                                }
+                                
+                                // 确保我们有数据可处理
+                                if (audioDataCopy == null || audioDataCopy.Count == 0)
+                                {
+                                    continue;
+                                }
+                                
+                                // 使用不带回调的Process方法，避免回调函数导致的内存问题
+                                Trace.TraceInformation("开始处理说话者识别，音频数据长度: {0}", audioDataCopy.Count);
+                                
+                                // 将List转换为数组
+                                
+                                // 处理音频数据，获取说话者分割结果
+                                var segmentSize = 60 * 1600; // 60秒的音频数据
+
+                                    // 将audioDataCopy 按每60秒分割
+                                    var segCnt = audioDataCopy.Count() / segmentSize;
+                                    var audioDataSegments = new List<float[]>();
+                                    for (int i = 0; i < segCnt; i++)
+                                    {
+                                        var segment = audioDataCopy.Skip(i * segmentSize).Take(segmentSize).ToArray();
+                                        float[] audioData = segment.ToArray();
+
+                                        // 分为两段进行执行
+                                        OfflineSpeakerDiarizationSegment[] segments = null;
+
+                                        try
+                                        {
+                                            // 使用固定大小的数组并确保GC不会在处理过程中移动它
+                                            GCHandle handle = GCHandle.Alloc(audioData, GCHandleType.Pinned);
+                                            try
+                                            {
+                                                // 获取固定数组的指针
+                                                IntPtr ptr = handle.AddrOfPinnedObject();
+
+                                                // 使用Process方法处理音频数据
+                                                segments = _speakerDiarization.Process(audioData);
+                                            }
+                                            finally
+                                            {
+                                                // 确保释放固定的内存
+                                                if (handle.IsAllocated)
+                                                    handle.Free();
+                                            }
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Trace.TraceError("{0:HH:mm:ss.fff} Error processing audio data: {1}", DateTime.Now, ex);
+                                            continue;
+                                        }
+
+                                        Trace.TraceInformation("说话者识别处理完成，分割结果数量: {0}", segments?.Count() ?? 0);
+
+                                        // 不需要清空读取缓冲区，因为我们使用的是副本
+
+                                        // 如果有分割结果，添加说话者信息
+                                        if (segments != null && segments.Any())
+                                        {
+                                            // 找到时长最长的说话者
+                                            var longestSegment = segments.OrderByDescending(s => s.End - s.Start).FirstOrDefault();
+                                            if (longestSegment != null)
+                                            {
+                                                // 添加说话者信息到文本
+                                                item = new TextInfo($"[说话者_{longestSegment.Speaker}] {text}");
+                                            }
+
+                                        }
+                                    }
+                                    
+                                
+                                
+                                
+                            }
+                            catch (Exception ex)
+                            {
+                                Trace.TraceError("{0:HH:mm:ss.fff} Speaker diarization error: {1}", DateTime.Now, ex);
+                            }
+                        }
+                        
                         SentenceDone?.Invoke(this, new SpeechEventArgs()
                         {
                             Text = item,
@@ -180,8 +370,17 @@ namespace TMSpeech.Recognizer.SherpaOnnx
 
             stream?.Dispose();
             recognizer?.Dispose();
+            punctuation?.Dispose();
+            _speakerDiarization?.Dispose();
             recognizer = null;
             stream = null;
+            punctuation = null;
+            _speakerDiarization = null;
+            lock (_bufferLock)
+            {
+                _writeBuffer.Clear();
+            }
+            _speakerSegments.Clear();
             thread = null;
         }
 
