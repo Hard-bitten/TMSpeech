@@ -70,7 +70,12 @@ namespace TMSpeech.Recognizer.SherpaOnnx
             if (key == "tokens") _config.Tokens = (string)value;
             if (key == "enable_punctuation") _config.EnablePunctuation = (bool)value;
             if (key == "punctuation_model") _config.PunctuationModel = (string)value;
-            if (key == "enable_meeting_mode") _config.EnableMeetingMode = (bool)value;
+            if (key == "enable_meeting_mode")
+            {
+                _config.EnableMeetingMode = (bool)value;
+                // 当会议模式状态改变时，更新表单项
+                FormItemsUpdated?.Invoke(this, EventArgs.Empty);
+            }
             if (key == "segmentation_model") _config.SegmentationModel = (string)value;
             if (key == "embedding_model") _config.EmbeddingModel = (string)value;
             if (key == "num_clusters") _config.NumClusters = Convert.ToInt32(value);
@@ -111,21 +116,31 @@ namespace TMSpeech.Recognizer.SherpaOnnx
 
             if (!string.IsNullOrEmpty(_config.Model))
             {
-                return new PluginConfigFormItem[]
+                var modelFormItems = new List<PluginConfigFormItem>
                 {
                     new PluginConfigFormItemOption("model", "模型", options),
                     new PluginConfigFormCheckBox("enable_punctuation", "启用标点符号"),
                     new PluginConfigFormItemFile("punctuation_model", "标点符号模型"),
-                    new PluginConfigFormCheckBox("enable_meeting_mode", "启用会议模式（说话者识别）"),
-                    new PluginConfigFormItemFile("segmentation_model", "说话者分割模型"),
-                    new PluginConfigFormItemFile("embedding_model", "说话者嵌入模型"),
-                    new PluginConfigFormItemNumber("num_clusters", "说话者数量", "", 1, 10, true),
-                    new PluginConfigFormCheckBox("use_clustering_threshold", "使用聚类阈值"),
-                    new PluginConfigFormItemNumber("clustering_threshold", "聚类阈值", "", 1, 10, false)
+                    new PluginConfigFormCheckBox("enable_meeting_mode", "启用会议模式（说话者识别）")
                 };
+
+                // 只有在启用会议模式时才显示相关配置项
+                if (_config.EnableMeetingMode)
+                {
+                    modelFormItems.AddRange(new PluginConfigFormItem[]
+                    {
+                        new PluginConfigFormItemFile("segmentation_model", "说话者分割模型"),
+                        new PluginConfigFormItemFile("embedding_model", "说话者嵌入模型"),
+                        new PluginConfigFormItemNumber("num_clusters", "说话者数量", "", 1, 10, true),
+                        new PluginConfigFormCheckBox("use_clustering_threshold", "使用聚类阈值"),
+                        new PluginConfigFormItemNumber("clustering_threshold", "聚类阈值", "", 1, 10, false)
+                    });
+                }
+
+                return modelFormItems;
             }
 
-            return new PluginConfigFormItem[]
+            var customFormItems = new List<PluginConfigFormItem>
             {
                 new PluginConfigFormItemOption("model", "模型", options),
                 new PluginConfigFormItemFile("encoder", "编码器"),
@@ -134,13 +149,23 @@ namespace TMSpeech.Recognizer.SherpaOnnx
                 new PluginConfigFormItemFile("tokens", "词表"),
                 new PluginConfigFormCheckBox("enable_punctuation", "启用标点符号"),
                 new PluginConfigFormItemFile("punctuation_model", "标点符号模型"),
-                new PluginConfigFormCheckBox("enable_meeting_mode", "启用会议模式（说话者识别）"),
-                new PluginConfigFormItemFile("segmentation_model", "说话者分割模型"),
-                new PluginConfigFormItemFile("embedding_model", "说话者嵌入模型"),
-                new PluginConfigFormItemNumber("num_clusters", "说话者数量", "", 1, 10, true),
-                new PluginConfigFormCheckBox("use_clustering_threshold", "使用聚类阈值"),
-                new PluginConfigFormItemNumber("clustering_threshold", "聚类阈值", "", 1, 10, false)
+                new PluginConfigFormCheckBox("enable_meeting_mode", "启用会议模式（说话者识别）")
             };
+
+            // 只有在启用会议模式时才显示相关配置项
+            if (_config.EnableMeetingMode)
+            {
+                customFormItems.AddRange(new PluginConfigFormItem[]
+                {
+                    new PluginConfigFormItemFile("segmentation_model", "说话者分割模型"),
+                    new PluginConfigFormItemFile("embedding_model", "说话者嵌入模型"),
+                    new PluginConfigFormItemNumber("num_clusters", "说话者数量", "", 1, 10, true),
+                    new PluginConfigFormCheckBox("use_clustering_threshold", "使用聚类阈值"),
+                    new PluginConfigFormItemNumber("clustering_threshold", "聚类阈值", "", 1, 10, false)
+                });
+            }
+
+            return customFormItems;
         }
 
         public event EventHandler<EventArgs>? FormItemsUpdated;

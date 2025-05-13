@@ -57,9 +57,29 @@ namespace TMSpeech.Recognizer.SherpaOnnx
             public string Text { get; set; }
         }
 
+        // 用于跟踪说话者的历史记录
+        private class SpeakerHistory
+        {
+            public int SpeakerId { get; set; }
+            public DateTime LastDetectedTime { get; set; }
+            public int ConsecutiveDetections { get; set; }
+            public float Confidence { get; set; }
+        }
+
         private List<SpeakerSegment> _speakerSegments = new List<SpeakerSegment>();
         private OfflineSpeakerDiarization _speakerDiarization;
         private bool _meetingModeEnabled = false;
+        
+        // 音频缓冲区，用于保存较长时间的音频数据
+        private List<float> _audioBuffer = new List<float>();
+        // 音频缓冲区的最大长度（以采样点为单位，16kHz采样率下60秒约为960000个采样点）
+        private const int MAX_AUDIO_BUFFER_SIZE = 480000;
+        // 处理窗口大小（以采样点为单位，30秒）
+        private const int PROCESSING_WINDOW_SIZE = 160000;
+        // 当前活跃的说话者ID
+        private int _currentSpeakerId = -1;
+        // 上次处理的音频长度（用于确保连续性）
+        private int _lastProcessedAudioLength = 0;
 
         public void Feed(byte[] data)
         {
@@ -72,6 +92,14 @@ namespace TMSpeech.Recognizer.SherpaOnnx
                 lock (_bufferLock)
                 {
                     _writeBuffer.AddRange(floatArray.Select(f => f));
+                    
+                    // 同时更新音频缓冲区
+                    _audioBuffer.AddRange(floatArray);
+                    // 如果音频缓冲区超过最大长度，移除最早的数据
+                    if (_audioBuffer.Count > MAX_AUDIO_BUFFER_SIZE)
+                    {
+                        _audioBuffer.RemoveRange(0, _audioBuffer.Count - MAX_AUDIO_BUFFER_SIZE);
+                    }
                 }
             }
             stream?.AcceptWaveform(config.FeatConfig.SampleRate, floatArray);
@@ -230,8 +258,10 @@ namespace TMSpeech.Recognizer.SherpaOnnx
                         {
                             try
                             {
-                                // 安全地获取音频数据副本
-                                List<float> audioDataCopy = null;
+                                // 安全地获取音频缓冲区的副本
+                                float[] processingAudio = null;
+                                int currentAudioLength = 0;
+                                
                                 lock (_bufferLock)
                                 {
                                     // 如果写入缓冲区为空，则不需要处理
@@ -240,84 +270,121 @@ namespace TMSpeech.Recognizer.SherpaOnnx
                                         continue;
                                     }
                                     
-                                    // 创建写入缓冲区的完整副本，而不是交换缓冲区
-                                    audioDataCopy = new List<float>(_writeBuffer);
+                                    // 记录当前新数据的长度
+                                    currentAudioLength = _writeBuffer.Count;
+                                    
+                                    // 将新数据添加到音频缓冲区
+                                    _audioBuffer.AddRange(_writeBuffer);
+                                    
+                                    // 如果音频缓冲区超过最大长度，移除最早的数据
+                                    if (_audioBuffer.Count > MAX_AUDIO_BUFFER_SIZE)
+                                    {
+                                        _audioBuffer.RemoveRange(0, _audioBuffer.Count - MAX_AUDIO_BUFFER_SIZE);
+                                    }
+                                    
+                                    // 提取最近的30秒音频数据用于处理
+                                    // 确保包含当前分片和相邻分片，以保证信息连续性
+                                    int dataToProcess = Math.Min(PROCESSING_WINDOW_SIZE, _audioBuffer.Count);
+                                    processingAudio = new float[dataToProcess];
+                                    Array.Copy(_audioBuffer.ToArray(), _audioBuffer.Count - dataToProcess, processingAudio, 0, dataToProcess);
                                     
                                     // 清空写入缓冲区，为新数据做准备
                                     _writeBuffer.Clear();
                                 }
                                 
-                                // 确保我们有数据可处理
-                                if (audioDataCopy == null || audioDataCopy.Count == 0)
+                                // 确保我们有足够的数据可处理
+                                if (processingAudio == null || processingAudio.Length < 16000) // 至少1秒的数据
                                 {
                                     continue;
                                 }
                                 
-                                // 使用不带回调的Process方法，避免回调函数导致的内存问题
-                                Trace.TraceInformation("开始处理说话者识别，音频数据长度: {0}", audioDataCopy.Count);
+                                Trace.TraceInformation("开始处理说话者识别，处理窗口长度: {0}，当前新数据长度: {1}",
+                                    processingAudio.Length, currentAudioLength);
                                 
-                                // 将List转换为数组
+                                // 处理提取的音频数据，获取说话者分割结果
+                                OfflineSpeakerDiarizationSegment[] segments = _speakerDiarization.Process(processingAudio);
                                 
-                                // 处理音频数据，获取说话者分割结果
-                                var segmentSize = 60 * 1600; // 60秒的音频数据
-
-                                    // 将audioDataCopy 按每60秒分割
-                                    var segCnt = audioDataCopy.Count() / segmentSize;
-                                    var audioDataSegments = new List<float[]>();
-                                    for (int i = 0; i < segCnt; i++)
+                                Trace.TraceInformation("说话者识别处理完成，分割结果数量: {0}", segments?.Count() ?? 0);
+                                
+                                // 如果有分割结果，分析说话者信息
+                                if (segments != null && segments.Any())
+                                {
+                                    // 计算每个说话者的总发言时间
+                                    Dictionary<int, float> speakerDurations = new Dictionary<int, float>();
+                                    
+                                    // 计算当前新数据在处理窗口中的起始时间点
+                                    float currentDataStartTime = 0;
+                                    if (processingAudio.Length > currentAudioLength)
                                     {
-                                        var segment = audioDataCopy.Skip(i * segmentSize).Take(segmentSize).ToArray();
-                                        float[] audioData = segment.ToArray();
-
-                                        // 分为两段进行执行
-                                        OfflineSpeakerDiarizationSegment[] segments = null;
-
-                                        try
+                                        currentDataStartTime = (float)(processingAudio.Length - currentAudioLength) / config.FeatConfig.SampleRate;
+                                    }
+                                    
+                                    // 主要关注当前新数据部分的说话者
+                                    // 但也考虑相邻部分的信息以保证连续性
+                                    foreach (var segment in segments)
+                                    {
+                                        // 计算与当前新数据的重叠部分
+                                        float overlapStart = Math.Max(segment.Start, currentDataStartTime);
+                                        float overlapEnd = segment.End;
+                                        
+                                        if (overlapEnd > currentDataStartTime) // 有重叠
                                         {
-                                            // 使用固定大小的数组并确保GC不会在处理过程中移动它
-                                            GCHandle handle = GCHandle.Alloc(audioData, GCHandleType.Pinned);
-                                            try
+                                            float duration = overlapEnd - overlapStart;
+                                            
+                                            // 给予当前新数据部分更高的权重
+                                            float weight = 1.0f;
+                                            if (segment.Start < currentDataStartTime)
                                             {
-                                                // 获取固定数组的指针
-                                                IntPtr ptr = handle.AddrOfPinnedObject();
-
-                                                // 使用Process方法处理音频数据
-                                                segments = _speakerDiarization.Process(audioData);
+                                                // 如果段开始于历史数据部分，给予较低权重
+                                                weight = 0.8f;
                                             }
-                                            finally
+                                            
+                                            if (speakerDurations.ContainsKey(segment.Speaker))
                                             {
-                                                // 确保释放固定的内存
-                                                if (handle.IsAllocated)
-                                                    handle.Free();
+                                                speakerDurations[segment.Speaker] += duration * weight;
                                             }
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            Trace.TraceError("{0:HH:mm:ss.fff} Error processing audio data: {1}", DateTime.Now, ex);
-                                            continue;
-                                        }
-
-                                        Trace.TraceInformation("说话者识别处理完成，分割结果数量: {0}", segments?.Count() ?? 0);
-
-                                        // 不需要清空读取缓冲区，因为我们使用的是副本
-
-                                        // 如果有分割结果，添加说话者信息
-                                        if (segments != null && segments.Any())
-                                        {
-                                            // 找到时长最长的说话者
-                                            var longestSegment = segments.OrderByDescending(s => s.End - s.Start).FirstOrDefault();
-                                            if (longestSegment != null)
+                                            else
                                             {
-                                                // 添加说话者信息到文本
-                                                item = new TextInfo($"[说话者_{longestSegment.Speaker}] {text}");
+                                                speakerDurations[segment.Speaker] = duration * weight;
                                             }
-
                                         }
                                     }
                                     
+                                    // 找出发言时间最长的说话者
+                                    int dominantSpeaker = -1;
+                                    
+                                    if (speakerDurations.Any())
+                                    {
+                                        dominantSpeaker = speakerDurations
+                                            .OrderByDescending(pair => pair.Value)
+                                            .First().Key;
+                                        
+                                        Trace.TraceInformation(
+                                            "检测到的主要说话者: {0}, 累计时长: {1:F2}秒",
+                                            dominantSpeaker,
+                                            speakerDurations[dominantSpeaker]
+                                        );
+                                    }
+                                    
+                                    // 确定是否需要切换当前说话者
+                                    if (dominantSpeaker >= 0)
+                                    {
+                                        // 如果当前没有活跃说话者，或者检测到的说话者与当前活跃说话者不同
+                                        if (_currentSpeakerId < 0 || dominantSpeaker != _currentSpeakerId)
+                                        {
+                                            _currentSpeakerId = dominantSpeaker;
+                                            Trace.TraceInformation("切换到新说话者: {0}", _currentSpeakerId);
+                                        }
+                                        
+                                        // 添加说话者信息到文本
+                                        item = new TextInfo($"[说话者_{_currentSpeakerId}] {text}");
+                                        
+                                        Trace.TraceInformation("最终使用的说话者ID: {0}", _currentSpeakerId);
+                                    }
+                                }
                                 
-                                
-                                
+                                // 更新上次处理的音频长度
+                                _lastProcessedAudioLength = currentAudioLength;
                             }
                             catch (Exception ex)
                             {
@@ -379,8 +446,11 @@ namespace TMSpeech.Recognizer.SherpaOnnx
             lock (_bufferLock)
             {
                 _writeBuffer.Clear();
+                _audioBuffer.Clear();
             }
             _speakerSegments.Clear();
+            _currentSpeakerId = -1;
+            _lastProcessedAudioLength = 0;
             thread = null;
         }
 

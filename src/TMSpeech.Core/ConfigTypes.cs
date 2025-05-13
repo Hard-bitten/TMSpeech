@@ -1,3 +1,6 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
 namespace TMSpeech.Core;
 
 public static class GeneralConfigTypes

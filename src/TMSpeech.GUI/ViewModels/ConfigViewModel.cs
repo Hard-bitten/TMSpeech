@@ -73,6 +73,68 @@ namespace TMSpeech.GUI.ViewModels
                     if (!dict.ContainsKey(PropertyToKey(p))) return;
                     var value = dict[PropertyToKey(p)];
                     var type = p.PropertyType;
+                    
+                    // 特殊处理集合类型
+                    if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))
+                    {
+                        // 如果值是JsonElement且为数组
+                        if (value is System.Text.Json.JsonElement jsonElement && jsonElement.ValueKind == System.Text.Json.JsonValueKind.Array)
+                        {
+                            // 获取List的元素类型
+                            var elementType = type.GetGenericArguments()[0];
+                            // 创建一个新的List实例
+                            var listType = typeof(List<>).MakeGenericType(elementType);
+                            var list = System.Activator.CreateInstance(listType);
+                            
+                            // 将JsonElement数组中的元素添加到List中
+                            foreach (var item in jsonElement.EnumerateArray())
+                            {
+                                object convertedItem;
+                                // 根据元素类型进行适当的转换
+                                if (elementType == typeof(int))
+                                {
+                                    convertedItem = item.GetInt32();
+                                }
+                                else if (elementType == typeof(long))
+                                {
+                                    convertedItem = item.GetInt64();
+                                }
+                                else if (elementType == typeof(double))
+                                {
+                                    convertedItem = item.GetDouble();
+                                }
+                                else if (elementType == typeof(string))
+                                {
+                                    convertedItem = item.GetString();
+                                }
+                                else if (elementType == typeof(bool))
+                                {
+                                    convertedItem = item.GetBoolean();
+                                }
+                                else
+                                {
+                                    // 对于其他类型，尝试使用通用方法
+                                    convertedItem = Convert.ChangeType(item.GetRawText().Trim('"'), elementType);
+                                }
+                                listType.GetMethod("Add").Invoke(list, new[] { convertedItem });
+                            }
+                            
+                            p.SetValue(this, list);
+                            return;
+                        }
+                        // 如果值是字符串"[]"（空数组）
+                        else if (value is string strValue && strValue == "[]")
+                        {
+                            // 创建一个空的List实例
+                            var elementType = type.GetGenericArguments()[0];
+                            var listType = typeof(List<>).MakeGenericType(elementType);
+                            var list = System.Activator.CreateInstance(listType);
+                            p.SetValue(this, list);
+                            return;
+                        }
+                    }
+                    
+                    // 对于其他类型，使用默认的Convert.ChangeType
                     p.SetValue(this, Convert.ChangeType(value, type));
                 });
         }
